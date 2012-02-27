@@ -9,7 +9,11 @@
     :license: BSD, see LICENSE for more details.
 """
 import os
+import ConfigParser
+import logging
+import random
 import redis
+import string
 import urlparse
 from werkzeug.wrappers import Request, Response
 from werkzeug.routing import Map, Rule
@@ -19,6 +23,21 @@ from werkzeug.utils import redirect
 
 from jinja2 import Environment, FileSystemLoader
 
+log = logging.getLogger("shortly")
+log.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+fh = logging.FileHandler('shortly.log')
+fh.setLevel(logging.INFO)
+fh.setFormatter(formatter)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(formatter)
+
+log.addHandler(fh)
+log.addHandler(ch)
 
 def base36_encode(number):
     assert number >= 0, 'positive integer required'
@@ -43,7 +62,12 @@ def get_hostname(url):
 class Shortly(object):
 
     def __init__(self, config):
-        self.redis = redis.Redis(config['redis_host'], config['redis_port'])
+        log.info("redis master: " + config['master'])
+        self.redis_master = self._init_redis(config['master'])
+        log.info("redis slaves: " + string.join(config['slaves'], ","))
+        self.redis_slave_ids = config['slaves']
+        self.redis_slaves = [self._init_redis(x) for x in config['slaves']]
+        self.redis_slave_num = len(self.redis_slaves)
         template_path = os.path.join(os.path.dirname(__file__), 'templates')
         self.jinja_env = Environment(loader=FileSystemLoader(template_path),
                                      autoescape=True)
@@ -55,6 +79,18 @@ class Shortly(object):
             Rule('/<short_id>+', endpoint='short_link_details')
         ])
 
+    def _init_redis(self, host):
+        host_port = host.rsplit(":")
+        if len(host_port) == 1:
+          host_port.append(6379)
+
+        return redis.Redis(host_port[0], host_port[1])
+
+    def _get_redis_slave(self):
+        idx = random.randint(0,self.redis_slave_num-1)
+        log.info("using redis slave " + self.redis_slave_ids[idx])
+        return self.redis_slaves[idx]
+        
     def on_new_url(self, request):
         error = None
         url = ''
@@ -68,17 +104,17 @@ class Shortly(object):
         return self.render_template('new_url.html', error=error, url=url)
 
     def on_follow_short_link(self, request, short_id):
-        link_target = self.redis.get('url-target:' + short_id)
+        link_target = self._get_redis_slave().get('url-target:' + short_id)
         if link_target is None:
             raise NotFound()
-        self.redis.incr('click-count:' + short_id)
+        self.redis_master.incr('click-count:' + short_id)
         return redirect(link_target)
 
     def on_short_link_details(self, request, short_id):
-        link_target = self.redis.get('url-target:' + short_id)
+        link_target = self._get_redis_slave().get('url-target:' + short_id)
         if link_target is None:
             raise NotFound()
-        click_count = int(self.redis.get('click-count:' + short_id) or 0)
+        click_count = int(self._get_redis_slave().get('click-count:' + short_id) or 0)
         return self.render_template('short_link_details.html',
             link_target=link_target,
             short_id=short_id,
@@ -91,13 +127,13 @@ class Shortly(object):
         return response
 
     def insert_url(self, url):
-        short_id = self.redis.get('reverse-url:' + url)
+        short_id = self._get_redis_slave().get('reverse-url:' + url)
         if short_id is not None:
             return short_id
-        url_num = self.redis.incr('last-url-id')
+        url_num = self.redis_master.incr('last-url-id')
         short_id = base36_encode(url_num)
-        self.redis.set('url-target:' + short_id, url)
-        self.redis.set('reverse-url:' + url, short_id)
+        self.redis_master.set('url-target:' + short_id, url)
+        self.redis_master.set('reverse-url:' + url, short_id)
         return short_id
 
     def render_template(self, template_name, **context):
@@ -123,19 +159,23 @@ class Shortly(object):
         return self.wsgi_app(environ, start_response)
 
 
-def create_app(redis_host='localhost', redis_port=6379, with_static=True):
-    app = Shortly({
-        'redis_host':       redis_host,
-        'redis_port':       redis_port
-    })
+def create_app(redis_config={'master':'localhost:6379',
+        'slaves':['localhost:6379']}, with_static=True):
+    app = Shortly(redis_config)
     if with_static:
         app.wsgi_app = SharedDataMiddleware(app.wsgi_app, {
             '/static':  os.path.join(os.path.dirname(__file__), 'static')
         })
     return app
 
+def parse_config(path='shortly.cfg'):
+    config = ConfigParser.ConfigParser()
+    config.read(path)
+    master = config.get('redis', 'master')
+    slaves = config.get('redis', 'slaves').rsplit(",")
+    return {'master': master, 'slaves': slaves}
 
 if __name__ == '__main__':
     from werkzeug.serving import run_simple
-    app = create_app()
-    run_simple('127.0.0.1', 5000, app, use_debugger=True, use_reloader=True)
+    app = create_app(parse_config())
+    run_simple('0.0.0.0', 5000, app, use_debugger=True, use_reloader=True)
