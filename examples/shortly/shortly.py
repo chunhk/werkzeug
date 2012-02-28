@@ -14,6 +14,7 @@ import logging
 import random
 import redis
 import string
+import sys
 import urlparse
 from werkzeug.wrappers import Request, Response
 from werkzeug.routing import Map, Rule
@@ -22,22 +23,6 @@ from werkzeug.wsgi import SharedDataMiddleware
 from werkzeug.utils import redirect
 
 from jinja2 import Environment, FileSystemLoader
-
-log = logging.getLogger("shortly")
-log.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-fh = logging.FileHandler('shortly.log')
-fh.setLevel(logging.INFO)
-fh.setFormatter(formatter)
-
-ch = logging.StreamHandler()
-ch.setLevel(logging.INFO)
-ch.setFormatter(formatter)
-
-log.addHandler(fh)
-log.addHandler(ch)
 
 def base36_encode(number):
     assert number >= 0, 'positive integer required'
@@ -173,9 +158,30 @@ def parse_config(path='shortly.cfg'):
     config.read(path)
     master = config.get('redis', 'master')
     slaves = config.get('redis', 'slaves').rsplit(",")
-    return {'master': master, 'slaves': slaves}
+    logfile = config.get('logging', 'logfile')
+    return {'master': master, 'slaves': slaves, 'logfile': logfile}
+
+def setup_logging(config):
+    global log
+    log = logging.getLogger("shortly")
+    log.setLevel(logging.INFO)
+
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    fh = logging.FileHandler(config['logfile'])
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(formatter)
+
+    log.addHandler(fh)
+    log.addHandler(ch)
 
 if __name__ == '__main__':
     from werkzeug.serving import run_simple
-    app = create_app(parse_config())
+    config = parse_config() if len(sys.argv) == 1 else parse_config(sys.argv[1])
+    setup_logging(config)
+    app = create_app(config)
     run_simple('0.0.0.0', 5000, app, use_debugger=True, use_reloader=True)
